@@ -106,6 +106,7 @@ body {
     padding: 16px 12px;
     text-align: center;
     flex: 1 1 auto;
+    overflow-y: auto;
 }
 
 .welcome-icon {
@@ -226,6 +227,198 @@ body {
     padding: 12px 4px 0 4px;
     /* Added top padding to separate from title bar */
     flex-shrink: 0;
+}
+
+/* Agent Requests / Inbox Area */
+.agent-requests-area {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    overflow: hidden;
+    padding-bottom: 8px;
+}
+
+.agent-requests-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    color: var(--vscode-descriptionForeground);
+    border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+.agent-requests-header .codicon {
+    font-size: 14px;
+    color: var(--vscode-foreground);
+}
+
+.agent-requests-header .codicon.clickable {
+    cursor: pointer;
+    padding: 2px;
+    border-radius: 4px;
+}
+
+.agent-requests-header .codicon.clickable:hover {
+    background-color: var(--vscode-toolbar-hoverBackground);
+}
+
+.agent-requests-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px;
+}
+
+.agent-request-item {
+    display: flex;
+    gap: 10px;
+    padding: 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    background-color: var(--vscode-list-hoverBackground);
+    margin-bottom: 8px;
+    border: 1px solid transparent;
+    transition: all 0.2s ease;
+    position: relative;
+}
+
+.agent-request-item:hover {
+    background-color: var(--vscode-list-activeSelectionBackground);
+    border-color: var(--vscode-focusBorder);
+}
+
+.agent-request-item.active {
+    background-color: var(--vscode-list-activeSelectionBackground);
+    border-color: var(--vscode-focusBorder);
+    box-shadow: 0 0 0 1px var(--vscode-focusBorder);
+}
+
+.agent-request-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    background-color: var(--vscode-badge-background);
+    color: var(--vscode-badge-foreground);
+    border-radius: 50%;
+    flex-shrink: 0;
+    position: relative;
+}
+
+.agent-pending-badge {
+    position: absolute;
+    top: -2px;
+    right: -2px;
+    width: 10px;
+    height: 10px;
+    background-color: var(--vscode-notificationsErrorIcon-foreground);
+    border: 2px solid var(--vscode-editor-background);
+    border-radius: 50%;
+}
+
+.agent-project-badge {
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 10px;
+    background-color: var(--vscode-badge-background);
+    color: var(--vscode-badge-foreground);
+    margin-left: 6px;
+    opacity: 0.9;
+    font-weight: normal;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100px;
+}
+
+.agent-request-content {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+}
+
+.agent-request-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 4px;
+}
+
+.agent-header-left {
+    display: flex;
+    align-items: center;
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+}
+
+.agent-request-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--vscode-foreground);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.agent-request-time {
+    font-size: 10px;
+    color: var(--vscode-descriptionForeground);
+    flex-shrink: 0;
+    margin-left: 8px;
+}
+
+.agent-request-preview {
+    font-size: 12px;
+    color: var(--vscode-descriptionForeground);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    opacity: 0.9;
+}
+
+/* Empty/Placeholder States */
+.inbox-placeholder {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    color: var(--vscode-descriptionForeground);
+    font-size: 13px;
+    font-style: italic;
+    padding: 20px;
+    text-align: center;
+}
+
+.empty-chat-placeholder {
+    padding: 20px;
+    text-align: center;
+    color: var(--vscode-descriptionForeground);
+    font-size: 13px;
+    font-style: italic;
+}
+
+/* Agent Badge in Tool Call Header */
+.tool-call-badge.agent {
+    background-color: var(--vscode-symbolIcon-classForeground);
+    color: #ffffff;
+}
+
+/* Pending Agent Badge in Message */
+.pending-agent-badge {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 6px;
+    border-radius: 4px;
+    background-color: var(--vscode-badge-background);
+    color: var(--vscode-badge-foreground);
+    margin: 4px 12px 0 12px;
 }
 
 /* Tool Call Card - Compact Design */

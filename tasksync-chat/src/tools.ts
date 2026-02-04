@@ -5,6 +5,8 @@ import { getImageMimeType } from './utils/imageUtils';
 
 export interface Input {
     question: string;
+    agent_name?: string;
+    project_name?: string;
 }
 
 export interface AskUserToolResult {
@@ -66,7 +68,7 @@ export async function askUser(
     try {
         // Race the user response against cancellation
         const result = await Promise.race([
-            provider.waitForUserResponse(params.question),
+            provider.waitForUserResponse(params.question, params.agent_name, params.project_name),
             cancellation.promise
         ]);
 
