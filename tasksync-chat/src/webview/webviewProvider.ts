@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import { FILE_EXCLUSION_PATTERNS, FILE_SEARCH_EXCLUSION_PATTERNS, formatExcludePattern } from '../constants/fileExclusions';
-import { ContextManager, ContextReferenceType, ContextReference } from '../context';
+import { ContextManager, ContextReferenceType } from '../context';
 
 // Queued prompt interface
 export interface QueuedPrompt {
@@ -128,8 +128,10 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
     public static readonly viewType = 'taskSyncView';
 
     private _view?: vscode.WebviewView;
-    private _pendingRequests: Map<string, (result: UserResponseResult) => void> = new Map(); // Legacy map for direct lookups
-    private _incomingRequests: Map<string, IncomingRequest> = new Map(); // New pool of requests
+    // Map of callbacks for in-flight user-response requests (supports existing callback-based flows)
+    private _pendingRequests: Map<string, (result: UserResponseResult) => void> = new Map();
+    // Pool of structured incoming requests tracked by the webview
+    private _incomingRequests: Map<string, IncomingRequest> = new Map();
 
     // Prompt queue state
     private _promptQueue: QueuedPrompt[] = [];
@@ -401,7 +403,29 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
         this._currentSessionCallsMap.clear();
 
         // Clear pending requests (reject any waiting promises)
+        for (const request of this._pendingRequests.values()) {
+            const maybeReject = (request as any)?.reject;
+            if (typeof maybeReject === 'function') {
+                try {
+                    maybeReject(new Error('Extension disposed before response was received.'));
+                } catch {
+                    // Ignore errors thrown while rejecting pending requests during dispose
+                }
+            }
+        }
         this._pendingRequests.clear();
+
+        // Clear incoming requests (reject any waiting promises)
+        for (const request of this._incomingRequests.values()) {
+            const maybeReject = (request as any)?.reject;
+            if (typeof maybeReject === 'function') {
+                try {
+                    maybeReject(new Error('Extension disposed before response was received.'));
+                } catch {
+                    // Ignore errors thrown while rejecting incoming requests during dispose
+                }
+            }
+        }
         this._incomingRequests.clear();
 
         // Clean up temp images from current session before clearing
@@ -564,8 +588,8 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
         };
 
         // Update session map - add to top
-        // Remove any other pending entries first to avoid duplicates or multiple pendings
-        this._currentSessionCalls = this._currentSessionCalls.filter(c => c.status !== 'pending');
+        // Remove any existing entry for this request ID to avoid duplicates
+        this._currentSessionCalls = this._currentSessionCalls.filter(c => c.id !== requestId);
         this._currentSessionCalls.unshift(pendingEntry);
         this._currentSessionCallsMap.set(requestId, pendingEntry);
 
@@ -815,7 +839,8 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             if (value && value.trim()) {
                 const queuedPrompt: QueuedPrompt = {
                     id: `q_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`,
-                    prompt: value.trim()
+                    prompt: value.trim(),
+                    attachments
                 };
                 this._promptQueue.push(queuedPrompt);
                 // Auto-switch to queue mode so user sees their message went to queue
@@ -1214,19 +1239,9 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             attachments: attachments.length > 0 ? [...attachments] : undefined  // Store attachments if any
         };
 
-        // Check if we should auto-respond BEFORE adding to queue (race condition fix)
-        // This prevents the window between push and findIndex where queue could be modified
-        const shouldAutoRespond = this._queueEnabled &&
-            this._currentToolCallId &&
-            this._pendingRequests.has(this._currentToolCallId); // Legacy check, but likely not used with new flow
-
-        // Actually with new flow, we only auto-respond if there IS a pending request that matches.
-        // But _pendingRequests is now legacy. We use _incomingRequests.
-        // However, auto-responding to a PENDING request means the AI is already waiting.
-
-        // Wait, _handleAddQueuePrompt is when USER types something and adds to queue.
-        // Does this mean "If AI is asking something, and I queue an answer, just give it to AI"?
-        // Yes.
+        // If there is a pending incoming tool call request waiting for user input,
+        // consume this prompt directly instead of queuing it.
+        // This avoids a race where the prompt could be queued while the AI is already waiting.
 
         if (this._currentToolCallId && this._incomingRequests.has(this._currentToolCallId)) {
              // Don't add to queue - consume directly for the pending request
@@ -1593,8 +1608,6 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             if (parsed.scheme !== 'context') return undefined;
 
             const type = parsed.authority as ContextReferenceType;
-            // id is likely in path, e.g. /id
-            const id = parsed.path.startsWith('/') ? parsed.path.substring(1) : parsed.path;
 
             const contextRef = await this._contextManager.getContextContent(type);
             return contextRef?.content;
@@ -1963,7 +1976,6 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
         return text;
     }
 
-    // ... (rest of the file: _parseChoices, _isApprovalQuestion)
     /**
      * Parse choices from a question text.
      * Detects numbered lists (1. 2. 3.), lettered options (A. B. C.), and Option X: patterns.
