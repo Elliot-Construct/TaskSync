@@ -10,12 +10,14 @@
 
     // State
     let promptQueue = [];
+    let incomingRequests = [];
     let queueEnabled = true; // Default to true (Queue mode ON by default)
     let dropdownOpen = false;
     let currentAttachments = previousState.attachments || []; // Restore attachments
     let selectedCard = 'queue';
     let currentSessionCalls = []; // Current session tool calls (shown in chat)
     let persistedHistory = []; // Past sessions history (shown in modal)
+    let activeAgent = null; // Currently selected agent for chat view
     let pendingToolCall = null;
     let isProcessingResponse = false; // True when AI is processing user's response
     let isApprovalQuestion = false; // True when current pending question is an approval-type question
@@ -55,7 +57,7 @@
     let queueSection, queueHeader, queueList, queueCount;
     let chatContainer, chipsContainer, autocompleteDropdown, autocompleteList, autocompleteEmpty;
     let inputContainer, inputAreaContainer, welcomeSection;
-    let cardVibe, cardSpec, toolHistoryArea, pendingMessage;
+    let cardVibe, cardSpec, toolHistoryArea, pendingMessage, agentRequestsArea, agentRequestsList;
     let historyModal, historyModalOverlay, historyModalList, historyModalClose, historyModalClearAll;
     // Edit mode elements
     let actionsLeft, actionsBar, editActionsContainer, editCancelBtn, editConfirmBtn;
@@ -138,6 +140,8 @@
         cardSpec = document.getElementById('card-spec');
         toolHistoryArea = document.getElementById('tool-history-area');
         pendingMessage = document.getElementById('pending-message');
+        agentRequestsArea = document.getElementById('agent-requests-area');
+        agentRequestsList = document.getElementById('agent-requests-list');
         // Slash command dropdown
         slashDropdown = document.getElementById('slash-dropdown');
         slashList = document.getElementById('slash-list');
@@ -783,16 +787,40 @@
                 // Hide welcome section if we have current session calls
                 updateWelcomeSectionVisibility();
                 break;
+            case 'updateIncomingRequests':
+                incomingRequests = message.requests || [];
+                renderAgentList();
+                // If we have an active agent, ensure we see their latest state
+                if (activeAgent) {
+                    // Check if active agent has a pending request
+                    const req = incomingRequests.find(r => r.agentName === activeAgent);
+                    if (req && (!pendingToolCall || pendingToolCall.id !== req.id)) {
+                        // Update pending tool call view for this agent
+                        showPendingToolCall(req.id, req.prompt, false, [], req.agentName);
+                    }
+                }
+                break;
             case 'toolCallPending':
                 console.log('[TaskSync Webview] toolCallPending - showing question:', message.prompt?.substring(0, 50));
-                showPendingToolCall(message.id, message.prompt, message.isApprovalQuestion, message.choices);
+                // Auto-switch to the new agent if no agent is selected
+                if (!activeAgent && message.agentName) {
+                    activeAgent = message.agentName;
+                }
+
+                // Only show if it matches active agent or if we are in "all" mode (which we might not implement fully yet)
+                if (activeAgent === message.agentName || !message.agentName) {
+                    showPendingToolCall(message.id, message.prompt, message.isApprovalQuestion, message.choices, message.agentName, message.projectName);
+                }
+                renderAgentList();
                 break;
             case 'toolCallCompleted':
                 addToolCallToCurrentSession(message.entry);
+                renderAgentList();
                 break;
             case 'updateCurrentSession':
                 currentSessionCalls = message.history || [];
                 renderCurrentSession();
+                renderAgentList();
                 // Hide welcome section if we have completed tool calls
                 updateWelcomeSectionVisibility();
                 // Auto-scroll to bottom after rendering
@@ -844,9 +872,9 @@
         }
     }
 
-    function showPendingToolCall(id, prompt, isApproval, choices) {
+    function showPendingToolCall(id, prompt, isApproval, choices, agentName, projectName) {
         console.log('[TaskSync Webview] showPendingToolCall called with id:', id);
-        pendingToolCall = { id: id, prompt: prompt };
+        pendingToolCall = { id: id, prompt: prompt, agentName: agentName };
         isProcessingResponse = false; // AI is now asking, not processing
         isApprovalQuestion = isApproval === true;
         currentChoices = choices || [];
@@ -862,7 +890,9 @@
         if (pendingMessage) {
             console.log('[TaskSync Webview] Setting pendingMessage innerHTML...');
             pendingMessage.classList.remove('hidden');
-            pendingMessage.innerHTML = '<div class="pending-ai-question">' + formatMarkdown(prompt) + '</div>';
+            var projectHtml = projectName ? '<div class="pending-project-badge">' + escapeHtml(projectName) + '</div>' : '';
+            var agentHtml = agentName ? '<div class="pending-agent-badge">' + escapeHtml(agentName) + '</div>' : '';
+            pendingMessage.innerHTML = '<div class="pending-header">' + agentHtml + projectHtml + '</div>' + '<div class="pending-ai-question">' + formatMarkdown(prompt) + '</div>';
             console.log('[TaskSync Webview] pendingMessage.innerHTML set, length:', pendingMessage.innerHTML.length);
         } else {
             console.error('[TaskSync Webview] pendingMessage element is null!');
@@ -870,6 +900,8 @@
 
         // Re-render current session (without the pending item - it's shown separately)
         renderCurrentSession();
+        // Update incoming requests list to show active state
+        renderAgentList();
         // Render any mermaid diagrams in pending message
         renderMermaidDiagrams();
         // Auto-scroll to show the new pending message
@@ -929,11 +961,22 @@
     function renderCurrentSession() {
         if (!toolHistoryArea) return;
 
+        // Filter by active agent if selected
+        let filteredCalls;
+        if (activeAgent) {
+            filteredCalls = currentSessionCalls.filter(c => (c.agentName || 'Unknown Agent') === activeAgent);
+        } else {
+            // If no agent selected (Inbox view), maybe show nothing or all?
+            // Let's show nothing in the chat area when in Inbox view to keep it clean
+            toolHistoryArea.innerHTML = '<div class="inbox-placeholder">Select a chat to start messaging</div>';
+            return;
+        }
+
         // Only show COMPLETED calls from current session (pending is shown separately as plain text)
-        var completedCalls = currentSessionCalls.filter(function (tc) { return tc.status === 'completed'; });
+        var completedCalls = filteredCalls.filter(function (tc) { return tc.status === 'completed'; });
 
         if (completedCalls.length === 0) {
-            toolHistoryArea.innerHTML = '';
+            toolHistoryArea.innerHTML = '<div class="empty-chat-placeholder">No history with ' + escapeHtml(activeAgent) + '</div>';
             return;
         }
 
@@ -945,6 +988,8 @@
             var firstSentence = tc.prompt.split(/[.!?]/)[0];
             var truncatedTitle = firstSentence.length > 120 ? firstSentence.substring(0, 120) + '...' : firstSentence;
             var queueBadge = tc.isFromQueue ? '<span class="tool-call-badge queue">Queue</span>' : '';
+            // Don't show agent badge in card if we are already in agent view
+            var agentBadge = '';
 
             // Build card HTML - NO X button for current session cards
             var isLatest = index === sortedCalls.length - 1;
@@ -953,7 +998,7 @@
                 '<div class="tool-call-chevron"><span class="codicon codicon-chevron-down"></span></div>' +
                 '<div class="tool-call-icon"><span class="codicon codicon-copilot"></span></div>' +
                 '<div class="tool-call-header-wrapper">' +
-                '<span class="tool-call-title">' + escapeHtml(truncatedTitle) + queueBadge + '</span>' +
+                '<span class="tool-call-title">' + escapeHtml(truncatedTitle) + queueBadge + agentBadge + '</span>' +
                 '</div>' +
                 '</div>' +
                 '<div class="tool-call-body">' +
@@ -996,13 +1041,14 @@
             var firstSentence = tc.prompt.split(/[.!?]/)[0];
             var truncatedTitle = firstSentence.length > 80 ? firstSentence.substring(0, 80) + '...' : firstSentence;
             var queueBadge = tc.isFromQueue ? '<span class="tool-call-badge queue">Queue</span>' : '';
+            var agentBadge = tc.agentName ? '<span class="tool-call-badge agent">' + escapeHtml(tc.agentName) + '</span>' : '';
 
             return '<div class="tool-call-card history-card" data-id="' + escapeHtml(tc.id) + '">' +
                 '<div class="tool-call-header">' +
                 '<div class="tool-call-chevron"><span class="codicon codicon-chevron-down"></span></div>' +
                 '<div class="tool-call-icon"><span class="codicon codicon-copilot"></span></div>' +
                 '<div class="tool-call-header-wrapper">' +
-                '<span class="tool-call-title">' + escapeHtml(truncatedTitle) + queueBadge + '</span>' +
+                '<span class="tool-call-title">' + escapeHtml(truncatedTitle) + queueBadge + agentBadge + '</span>' +
                 '</div>' +
                 '<button class="tool-call-remove" data-id="' + escapeHtml(tc.id) + '" title="Remove"><span class="codicon codicon-close"></span></button>' +
                 '</div>' +
@@ -1384,6 +1430,136 @@
 
         bindDragAndDrop();
         bindKeyboardNavigation();
+    }
+
+    function getAgentsList() {
+        const agentMap = new Map();
+
+        // Add agents from incoming requests
+        incomingRequests.forEach(req => {
+            const name = req.agentName || 'Unknown Agent';
+            if (!agentMap.has(name)) {
+                agentMap.set(name, {
+                    name: name,
+                    projectName: req.projectName,
+                    hasPending: true,
+                    lastMessage: req.prompt,
+                    timestamp: req.timestamp
+                });
+            } else {
+                // Update with latest pending
+                const existing = agentMap.get(name);
+                if (req.timestamp > existing.timestamp) {
+                    existing.lastMessage = req.prompt;
+                    existing.timestamp = req.timestamp;
+                    existing.hasPending = true;
+                    if (req.projectName) existing.projectName = req.projectName;
+                }
+            }
+        });
+
+        // Add agents from history
+        currentSessionCalls.forEach(call => {
+            const name = call.agentName || 'Unknown Agent';
+            if (!agentMap.has(name)) {
+                agentMap.set(name, {
+                    name: name,
+                    projectName: call.projectName,
+                    hasPending: false,
+                    lastMessage: call.prompt,
+                    timestamp: call.timestamp
+                });
+            }
+        });
+
+        return Array.from(agentMap.values()).sort((a, b) => {
+            // Sort by pending status first, then timestamp
+            if (a.hasPending !== b.hasPending) return a.hasPending ? -1 : 1;
+            return b.timestamp - a.timestamp;
+        });
+    }
+
+    function renderAgentList() {
+        if (!agentRequestsList || !agentRequestsArea) return;
+
+        const agents = getAgentsList();
+
+        if (agents.length === 0) {
+            agentRequestsArea.classList.add('hidden');
+            return;
+        }
+
+        // Always show the area if we have agents
+        agentRequestsArea.classList.remove('hidden');
+
+        // Show "Back to Inbox" button if an agent is selected
+        const headerTitle = agentRequestsArea.querySelector('.agent-requests-title');
+        const headerIcon = agentRequestsArea.querySelector('.codicon');
+
+        if (activeAgent) {
+            agentRequestsList.classList.add('hidden');
+            if (headerTitle) headerTitle.textContent = activeAgent;
+            if (headerIcon) {
+                headerIcon.className = 'codicon codicon-arrow-left clickable';
+                headerIcon.onclick = function(e) {
+                    e.stopPropagation();
+                    activeAgent = null;
+                    pendingToolCall = null;
+                    renderCurrentSession();
+                    renderAgentList();
+                    // Clear pending message view
+                    if (pendingMessage) pendingMessage.classList.add('hidden');
+                };
+            }
+            return; // Don't render list when in chat mode
+        } else {
+            agentRequestsList.classList.remove('hidden');
+            if (headerTitle) headerTitle.textContent = 'Inbox';
+            if (headerIcon) {
+                headerIcon.className = 'codicon codicon-inbox';
+                headerIcon.onclick = null;
+            }
+        }
+
+        agentRequestsList.innerHTML = agents.map(function (agent) {
+            var isActive = activeAgent === agent.name;
+            var truncatedPrompt = agent.lastMessage.length > 60 ? agent.lastMessage.substring(0, 60) + '...' : agent.lastMessage;
+            var timeString = new Date(agent.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            var pendingBadge = agent.hasPending ? '<span class="agent-pending-badge"></span>' : '';
+            var projectBadge = agent.projectName ? '<span class="agent-project-badge">' + escapeHtml(agent.projectName) + '</span>' : '';
+
+            return '<div class="agent-request-item' + (isActive ? ' active' : '') + '" data-agent="' + escapeHtml(agent.name) + '">' +
+                '<div class="agent-request-icon"><span class="codicon codicon-hubot"></span>' + pendingBadge + '</div>' +
+                '<div class="agent-request-content">' +
+                '<div class="agent-request-header">' +
+                '<div class="agent-header-left">' +
+                '<span class="agent-request-name">' + escapeHtml(agent.name) + '</span>' +
+                projectBadge +
+                '</div>' +
+                '<span class="agent-request-time">' + timeString + '</span>' +
+                '</div>' +
+                '<div class="agent-request-preview">' + escapeHtml(truncatedPrompt) + '</div>' +
+                '</div></div>';
+        }).join('');
+
+        agentRequestsList.querySelectorAll('.agent-request-item').forEach(function (item) {
+            item.addEventListener('click', function () {
+                var agentName = item.getAttribute('data-agent');
+                activeAgent = agentName;
+                renderCurrentSession();
+                renderAgentList();
+
+                // Find pending request for this agent and activate it
+                const req = incomingRequests.find(r => r.agentName === agentName);
+                if (req) {
+                    vscode.postMessage({ type: 'switchActiveRequest', requestId: req.id });
+                } else {
+                    // No pending request, just showing history
+                    // Clear pending message view
+                    if (pendingMessage) pendingMessage.classList.add('hidden');
+                }
+            });
+        });
     }
 
     function startEditPrompt(id) {

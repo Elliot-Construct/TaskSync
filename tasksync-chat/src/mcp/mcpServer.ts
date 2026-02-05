@@ -100,17 +100,25 @@ export class McpServerManager {
                         question: z.string()
                             .min(1, "Question cannot be empty")
                             .max(MAX_QUESTION_LENGTH, `Question cannot exceed ${MAX_QUESTION_LENGTH} characters`)
-                            .describe("The question or prompt to display to the user")
+                            .describe("The question or prompt to display to the user"),
+                        agent_name: z.string().optional()
+                            .describe("The name of the agent asking the question"),
+                        project_name: z.string().optional()
+                            .describe("The name of the project or workspace the agent is working in")
                     })
                 },
-                async (args: { question: string }, extra: { signal?: AbortSignal }) => {
+                async (args: { question: string; agent_name?: string; project_name?: string }, extra: { signal?: AbortSignal }) => {
                     const tokenSource = new vscode.CancellationTokenSource();
                     if (extra.signal) {
                         extra.signal.onabort = () => tokenSource.cancel();
                     }
 
                     const result = await askUser(
-                        { question: args.question },
+                        {
+                            question: args.question,
+                            agent_name: args.agent_name,
+                            project_name: args.project_name
+                        },
                         provider,
                         tokenSource.token
                     );

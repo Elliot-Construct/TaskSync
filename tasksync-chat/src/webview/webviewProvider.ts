@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import { FILE_EXCLUSION_PATTERNS, FILE_SEARCH_EXCLUSION_PATTERNS, formatExcludePattern } from '../constants/fileExclusions';
-import { ContextManager, ContextReferenceType, ContextReference } from '../context';
+import { ContextManager, ContextReferenceType } from '../context';
 
 // Queued prompt interface
 export interface QueuedPrompt {
@@ -43,11 +43,24 @@ export interface UserResponseResult {
 export interface ToolCallEntry {
     id: string;
     prompt: string;
+    agentName?: string;
+    projectName?: string;
     response: string;
     timestamp: number;
     isFromQueue: boolean;
     status: 'pending' | 'completed' | 'cancelled';
     attachments?: AttachmentInfo[];
+}
+
+// Incoming request interface
+export interface IncomingRequest {
+    id: string;
+    prompt: string;
+    agentName?: string;
+    projectName?: string;
+    timestamp: number;
+    resolve: (result: UserResponseResult) => void;
+    reject: (error: Error) => void;
 }
 
 // Parsed choice from question
@@ -67,10 +80,11 @@ export interface ReusablePrompt {
 // Message types
 type ToWebviewMessage =
     | { type: 'updateQueue'; queue: QueuedPrompt[]; enabled: boolean }
-    | { type: 'toolCallPending'; id: string; prompt: string; isApprovalQuestion: boolean; choices?: ParsedChoice[] }
+    | { type: 'toolCallPending'; id: string; prompt: string; agentName?: string; projectName?: string; isApprovalQuestion: boolean; choices?: ParsedChoice[] }
     | { type: 'toolCallCompleted'; entry: ToolCallEntry }
     | { type: 'updateCurrentSession'; history: ToolCallEntry[] }
     | { type: 'updatePersistedHistory'; history: ToolCallEntry[] }
+    | { type: 'updateIncomingRequests'; requests: Array<{ id: string; prompt: string; agentName?: string; projectName?: string; timestamp: number }> }
     | { type: 'fileSearchResults'; files: FileSearchResult[] }
     | { type: 'updateAttachments'; attachments: AttachmentInfo[] }
     | { type: 'imageSaved'; attachment: AttachmentInfo }
@@ -94,6 +108,7 @@ type FromWebviewMessage =
     | { type: 'removeHistoryItem'; callId: string }
     | { type: 'clearPersistedHistory' }
     | { type: 'openHistoryModal' }
+    | { type: 'switchActiveRequest'; requestId: string }
     | { type: 'searchFiles'; query: string }
     | { type: 'saveImage'; data: string; mimeType: string }
     | { type: 'addFileReference'; file: FileSearchResult }
@@ -114,7 +129,10 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
     public static readonly viewType = 'taskSyncView';
 
     private _view?: vscode.WebviewView;
+    // Map of callbacks for in-flight user-response requests (supports existing callback-based flows)
     private _pendingRequests: Map<string, (result: UserResponseResult) => void> = new Map();
+    // Pool of structured incoming requests tracked by the webview
+    private _incomingRequests: Map<string, IncomingRequest> = new Map();
 
     // Prompt queue state
     private _promptQueue: QueuedPrompt[] = [];
@@ -131,7 +149,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
 
     // Webview ready state - prevents race condition on first message
     private _webviewReady: boolean = false;
-    private _pendingToolCallMessage: { id: string; prompt: string } | null = null;
+    private _pendingToolCallMessage: { id: string; prompt: string; agentName?: string; projectName?: string } | null = null;
 
     // Debounce timer for queue persistence
     private _queueSaveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -386,7 +404,15 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
         this._currentSessionCallsMap.clear();
 
         // Clear pending requests (reject any waiting promises)
+        for (const request of this._incomingRequests.values()) {
+            try {
+                request.reject(new Error('Extension disposed before response was received.'));
+            } catch {
+                // Ignore errors thrown while rejecting pending requests during dispose
+            }
+        }
         this._pendingRequests.clear();
+        this._incomingRequests.clear();
 
         // Clean up temp images from current session before clearing
         this._cleanupTempImagesFromEntries(this._currentSessionCalls);
@@ -449,7 +475,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
     /**
      * Wait for user response
      */
-    public async waitForUserResponse(question: string): Promise<UserResponseResult> {
+    public async waitForUserResponse(question: string, agentName?: string, projectName?: string): Promise<UserResponseResult> {
         // If view is not available, open the sidebar first
         if (!this._view) {
             // Open the TaskSync sidebar view
@@ -468,36 +494,9 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             }
         }
 
-        // Race condition prevention: If there's already a pending request, cancel it
-        // This prevents orphaned promises when waitForUserResponse is called multiple times
-        if (this._currentToolCallId && this._pendingRequests.has(this._currentToolCallId)) {
-            const oldToolCallId = this._currentToolCallId;
-            const oldResolve = this._pendingRequests.get(oldToolCallId);
-            if (oldResolve) {
-                // Resolve the orphaned promise with a cancellation indicator
-                oldResolve({
-                    value: '[CANCELLED: New request superseded this one]',
-                    queue: false,
-                    attachments: [],
-                    cancelled: true
-                });
-                this._pendingRequests.delete(oldToolCallId);
-
-                // Update the old entry status to indicate it was superseded
-                const oldEntry = this._currentSessionCallsMap.get(oldToolCallId);
-                if (oldEntry && oldEntry.status === 'pending') {
-                    oldEntry.status = 'cancelled';
-                    oldEntry.response = '[Superseded by new request]';
-                    this._updateCurrentSessionUI();
-                }
-                console.warn(`[TaskSync] Previous request ${oldToolCallId} was superseded by new request`);
-            }
-        }
-
         const toolCallId = `tc_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-        this._currentToolCallId = toolCallId;
 
-        // Check if queue is enabled and has prompts - auto-respond
+        // Check if queue is enabled and has prompts - auto-respond (legacy prompt queue)
         if (this._queueEnabled && this._promptQueue.length > 0) {
             const queuedPrompt = this._promptQueue.shift();
             if (queuedPrompt) {
@@ -508,6 +507,8 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                 const entry: ToolCallEntry = {
                     id: toolCallId,
                     prompt: question,
+                    agentName,
+                    projectName,
                     response: queuedPrompt.prompt,
                     timestamp: Date.now(),
                     isFromQueue: true,
@@ -516,7 +517,8 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                 this._currentSessionCalls.unshift(entry);
                 this._currentSessionCallsMap.set(entry.id, entry); // Maintain O(1) lookup map
                 this._updateCurrentSessionUI();
-                this._currentToolCallId = null;
+
+                // Note: We do NOT set _currentToolCallId here because it's already completed
 
                 return {
                     value: queuedPrompt.prompt,
@@ -528,54 +530,79 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
 
         this._view.show(true);
 
-        // Add pending entry to current session (so we have the prompt when completing)
+        return new Promise<UserResponseResult>((resolve, reject) => {
+            // Use provided project name, or fallback to workspace name if available
+            const effectiveProjectName = projectName || vscode.workspace.name;
+
+            const request: IncomingRequest = {
+                id: toolCallId,
+                prompt: question,
+                agentName,
+                projectName: effectiveProjectName,
+                timestamp: Date.now(),
+                resolve,
+                reject
+            };
+            this._incomingRequests.set(toolCallId, request);
+            this._updateIncomingRequestsUI();
+
+            // If no active request, make this one active
+            if (!this._currentToolCallId) {
+                this._setActiveRequest(toolCallId);
+            }
+        });
+    }
+
+    /**
+     * Set the active tool request ID
+     */
+    private _setActiveRequest(requestId: string): void {
+        const request = this._incomingRequests.get(requestId);
+        if (!request) return;
+
+        this._currentToolCallId = requestId;
+
+        // Create pending entry for UI
         const pendingEntry: ToolCallEntry = {
-            id: toolCallId,
-            prompt: question,
+            id: requestId,
+            prompt: request.prompt,
+            agentName: request.agentName,
+            projectName: request.projectName,
             response: '',
-            timestamp: Date.now(),
+            timestamp: request.timestamp,
             isFromQueue: false,
             status: 'pending'
         };
-        this._currentSessionCalls.unshift(pendingEntry);
-        this._currentSessionCallsMap.set(toolCallId, pendingEntry); // O(1) lookup
 
-        // Parse choices from question and determine if it's an approval question
-        const choices = this._parseChoices(question);
-        const isApproval = choices.length === 0 && this._isApprovalQuestion(question);
+        // Update session map - add to top
+        // Remove any existing entry for this request ID to avoid duplicates
+        this._currentSessionCalls = this._currentSessionCalls.filter(c => c.id !== requestId);
+        this._currentSessionCalls.unshift(pendingEntry);
+        this._currentSessionCallsMap.set(requestId, pendingEntry);
+
+        // Notify UI
+        const choices = this._parseChoices(request.prompt);
+        const isApproval = choices.length === 0 && this._isApprovalQuestion(request.prompt);
 
         // Wait for webview to be ready (JS initialized) before sending message
-        if (!this._webviewReady) {
-            // Wait for webview JS to initialize (up to 3 seconds)
-            const maxWaitMs = 3000;
-            const pollIntervalMs = 50;
-            let waited = 0;
-            while (!this._webviewReady && waited < maxWaitMs) {
-                await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
-                waited += pollIntervalMs;
-            }
-        }
-
-        // Send pending tool call to webview
         if (this._webviewReady && this._view) {
             this._view.webview.postMessage({
                 type: 'toolCallPending',
-                id: toolCallId,
-                prompt: question,
+                id: requestId,
+                prompt: request.prompt,
+                agentName: request.agentName,
+                projectName: request.projectName,
                 isApprovalQuestion: isApproval,
                 choices: choices.length > 0 ? choices : undefined
             });
             // Play notification sound when AI triggers ask_user
             this.playNotificationSound();
         } else {
-            // Fallback: queue the message (should rarely happen now)
-            this._pendingToolCallMessage = { id: toolCallId, prompt: question };
+            // Fallback: queue the message
+            this._pendingToolCallMessage = { id: requestId, prompt: request.prompt, agentName: request.agentName, projectName: request.projectName };
         }
-        this._updateCurrentSessionUI();
 
-        return new Promise<UserResponseResult>((resolve) => {
-            this._pendingRequests.set(toolCallId, resolve);
-        });
+        this._updateCurrentSessionUI();
     }
 
     /**
@@ -625,6 +652,9 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                 break;
             case 'openHistoryModal':
                 this._handleOpenHistoryModal();
+                break;
+            case 'switchActiveRequest':
+                this._handleSwitchActiveRequest(message.requestId);
                 break;
             case 'searchFiles':
                 this._handleSearchFiles(message.query);
@@ -683,35 +713,39 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
         this._updateSettingsUI();
         // Send initial queue state and current session history
         this._updateQueueUI();
+        this._updateIncomingRequestsUI(); // Send pending requests
         this._updateCurrentSessionUI();
 
         // If there's a pending tool call message that was never sent, send it now
         if (this._pendingToolCallMessage) {
-            const prompt = this._pendingToolCallMessage.prompt;
+            const prompt = this._pendingToolCallMessage.prompt || '';
             const choices = this._parseChoices(prompt);
             const isApproval = choices.length === 0 && this._isApprovalQuestion(prompt);
             this._view?.webview.postMessage({
                 type: 'toolCallPending',
                 id: this._pendingToolCallMessage.id,
                 prompt: prompt,
+                agentName: this._pendingToolCallMessage.agentName,
+                projectName: this._pendingToolCallMessage.projectName,
                 isApprovalQuestion: isApproval,
                 choices: choices.length > 0 ? choices : undefined
             });
             this._pendingToolCallMessage = null;
         }
-        // If there's an active pending request (webview was hidden/recreated while waiting),
+        // If there's an active request (webview was hidden/recreated while waiting),
         // re-send the pending tool call message so the user sees the question again
-        else if (this._currentToolCallId && this._pendingRequests.has(this._currentToolCallId)) {
-            // Find the pending entry to get the prompt
-            const pendingEntry = this._currentSessionCallsMap.get(this._currentToolCallId);
-            if (pendingEntry && pendingEntry.status === 'pending') {
-                const prompt = pendingEntry.prompt;
+        else if (this._currentToolCallId) {
+            const request = this._incomingRequests.get(this._currentToolCallId);
+            if (request) {
+                const prompt = request.prompt;
                 const choices = this._parseChoices(prompt);
                 const isApproval = choices.length === 0 && this._isApprovalQuestion(prompt);
                 this._view?.webview.postMessage({
                     type: 'toolCallPending',
                     id: this._currentToolCallId,
                     prompt: prompt,
+                    agentName: request.agentName,
+                    projectName: request.projectName,
                     isApprovalQuestion: isApproval,
                     choices: choices.length > 0 ? choices : undefined
                 });
@@ -719,73 +753,109 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
         }
     }
 
+    private _handleSwitchActiveRequest(requestId: string): void {
+        if (requestId === this._currentToolCallId) return;
+        if (!this._incomingRequests.has(requestId)) return;
+
+        this._setActiveRequest(requestId);
+    }
+
     /**
      * Handle submit from webview
      */
     private _handleSubmit(value: string, attachments: AttachmentInfo[]): void {
-        if (this._pendingRequests.size > 0 && this._currentToolCallId) {
-            const resolve = this._pendingRequests.get(this._currentToolCallId);
-            if (resolve) {
-                // O(1) lookup using Map instead of O(n) findIndex
-                const pendingEntry = this._currentSessionCallsMap.get(this._currentToolCallId);
+        // If we have an active tool call, process it
+        if (this._currentToolCallId && this._incomingRequests.has(this._currentToolCallId)) {
+            const request = this._incomingRequests.get(this._currentToolCallId)!;
+            const resolve = request.resolve;
 
-                let completedEntry: ToolCallEntry;
-                if (pendingEntry && pendingEntry.status === 'pending') {
-                    // Update existing pending entry
-                    pendingEntry.response = value;
-                    pendingEntry.attachments = attachments;
-                    pendingEntry.status = 'completed';
-                    pendingEntry.timestamp = Date.now();
-                    completedEntry = pendingEntry;
-                } else {
-                    // Create new completed entry (shouldn't happen normally)
-                    completedEntry = {
-                        id: this._currentToolCallId,
-                        prompt: 'Tool call',
-                        response: value,
-                        attachments: attachments,
-                        timestamp: Date.now(),
-                        isFromQueue: false,
-                        status: 'completed'
-                    };
-                    this._currentSessionCalls.unshift(completedEntry);
-                    this._currentSessionCallsMap.set(completedEntry.id, completedEntry);
-                }
+            // O(1) lookup using Map instead of O(n) findIndex
+            const pendingEntry = this._currentSessionCallsMap.get(this._currentToolCallId);
 
-                // Send toolCallCompleted to trigger "Working...." state in webview
-                this._view?.webview.postMessage({
-                    type: 'toolCallCompleted',
-                    entry: completedEntry
-                } as ToWebviewMessage);
-
-                this._updateCurrentSessionUI();
-                resolve({ value, queue: this._queueEnabled, attachments });
-                this._pendingRequests.delete(this._currentToolCallId);
-                this._currentToolCallId = null;
+            let completedEntry: ToolCallEntry;
+            if (pendingEntry && pendingEntry.status === 'pending') {
+                // Update existing pending entry
+                pendingEntry.response = value;
+                pendingEntry.attachments = attachments;
+                pendingEntry.status = 'completed';
+                pendingEntry.timestamp = Date.now();
+                completedEntry = pendingEntry;
             } else {
-                // No pending tool call - add message to queue for later use
-                if (value && value.trim()) {
-                    const queuedPrompt: QueuedPrompt = {
-                        id: `q_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`,
-                        prompt: value.trim()
-                    };
-                    this._promptQueue.push(queuedPrompt);
-                    // Auto-switch to queue mode so user sees their message went to queue
-                    this._queueEnabled = true;
-                    this._saveQueueToDisk();
-                    this._updateQueueUI();
+                // Create new completed entry (shouldn't happen normally)
+                completedEntry = {
+                    id: this._currentToolCallId,
+                    prompt: request.prompt,
+                    agentName: request.agentName,
+                    projectName: request.projectName,
+                    response: value,
+                    attachments: attachments,
+                    timestamp: Date.now(),
+                    isFromQueue: false,
+                    status: 'completed'
+                };
+                this._currentSessionCalls.unshift(completedEntry);
+                this._currentSessionCallsMap.set(completedEntry.id, completedEntry);
+            }
+
+            // Send toolCallCompleted to trigger "Working...." state in webview
+            this._view?.webview.postMessage({
+                type: 'toolCallCompleted',
+                entry: completedEntry
+            } as ToWebviewMessage);
+
+            this._updateCurrentSessionUI();
+
+            // Resolve the promise
+            resolve({ value, queue: this._queueEnabled, attachments });
+
+            // Remove from incoming requests map
+            this._incomingRequests.delete(this._currentToolCallId);
+            this._currentToolCallId = null;
+            this._updateIncomingRequestsUI();
+
+            // Auto-select next request if available
+            if (this._incomingRequests.size > 0) {
+                // Pick the oldest one (first in map iteration)
+                const nextId = this._incomingRequests.keys().next().value;
+                if (nextId) {
+                    this._setActiveRequest(nextId);
                 }
             }
-            // NOTE: Temp images are NOT cleaned up here anymore.
-            // They are stored in the ToolCallEntry.attachments and will be cleaned up when:
-            // 1. clearCurrentSession() is called
-            // 2. dispose() is called (extension deactivation)
-            // This ensures images are available for the entire session duration.
-
-            // Clear attachments after submit and sync with webview
+        } else {
+            // No pending tool call - add message to queue for later use
+            if (value && value.trim()) {
+                const queuedPrompt: QueuedPrompt = {
+                    id: `q_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`,
+                    prompt: value.trim(),
+                    attachments
+                };
+                this._promptQueue.push(queuedPrompt);
+                // Auto-switch to queue mode so user sees their message went to queue
+                this._queueEnabled = true;
+                this._saveQueueToDisk();
+                this._updateQueueUI();
+            }
+            // Clear attachments after submit
             this._attachments = [];
             this._updateAttachmentsUI();
         }
+    }
+
+    private _updateIncomingRequestsUI(): void {
+        if (!this._view) return;
+
+        const requests = Array.from(this._incomingRequests.values()).map(r => ({
+            id: r.id,
+            prompt: r.prompt,
+            agentName: r.agentName,
+            projectName: r.projectName,
+            timestamp: r.timestamp
+        }));
+
+        this._view.webview.postMessage({
+            type: 'updateIncomingRequests',
+            requests
+        } as ToWebviewMessage);
     }
 
     /**
@@ -1156,55 +1226,64 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             attachments: attachments.length > 0 ? [...attachments] : undefined  // Store attachments if any
         };
 
-        // Check if we should auto-respond BEFORE adding to queue (race condition fix)
-        // This prevents the window between push and findIndex where queue could be modified
-        const shouldAutoRespond = this._queueEnabled &&
-            this._currentToolCallId &&
-            this._pendingRequests.has(this._currentToolCallId);
+        // If there is a pending incoming tool call request waiting for user input,
+        // consume this prompt directly instead of queuing it.
+        // This avoids a race where the prompt could be queued while the AI is already waiting.
 
-        if (shouldAutoRespond) {
-            // Don't add to queue - consume directly for the pending request
-            const resolve = this._pendingRequests.get(this._currentToolCallId!);
-            if (!resolve) return;
+        if (this._currentToolCallId && this._incomingRequests.has(this._currentToolCallId)) {
+             // Don't add to queue - consume directly for the pending request
+             const request = this._incomingRequests.get(this._currentToolCallId)!;
+             const resolve = request.resolve;
 
-            // Update the pending entry to completed
-            const pendingEntry = this._currentSessionCallsMap.get(this._currentToolCallId!);
+             // Update entry...
+             const pendingEntry = this._currentSessionCallsMap.get(this._currentToolCallId);
+             // ... same logic as in _handleSubmit ...
 
-            let completedEntry: ToolCallEntry;
-            if (pendingEntry && pendingEntry.status === 'pending') {
-                pendingEntry.response = queuedPrompt.prompt;
-                pendingEntry.attachments = queuedPrompt.attachments;
-                pendingEntry.status = 'completed';
-                pendingEntry.isFromQueue = true;
-                pendingEntry.timestamp = Date.now();
-                completedEntry = pendingEntry;
-            } else {
-                completedEntry = {
-                    id: this._currentToolCallId!,
-                    prompt: 'Tool call',
-                    response: queuedPrompt.prompt,
-                    attachments: queuedPrompt.attachments,
-                    timestamp: Date.now(),
-                    isFromQueue: true,
-                    status: 'completed'
-                };
-                this._currentSessionCalls.unshift(completedEntry);
-                this._currentSessionCallsMap.set(completedEntry.id, completedEntry);
-            }
+             let completedEntry: ToolCallEntry;
+             if (pendingEntry && pendingEntry.status === 'pending') {
+                 pendingEntry.response = queuedPrompt.prompt;
+                 pendingEntry.attachments = queuedPrompt.attachments;
+                 pendingEntry.status = 'completed';
+                 pendingEntry.isFromQueue = true;
+                 pendingEntry.timestamp = Date.now();
+                 completedEntry = pendingEntry;
+             } else {
+                 completedEntry = {
+                     id: this._currentToolCallId,
+                     prompt: request.prompt,
+                     agentName: request.agentName,
+                     projectName: request.projectName,
+                     response: queuedPrompt.prompt,
+                     attachments: queuedPrompt.attachments,
+                     timestamp: Date.now(),
+                     isFromQueue: true,
+                     status: 'completed'
+                 };
+                 this._currentSessionCalls.unshift(completedEntry);
+                 this._currentSessionCallsMap.set(completedEntry.id, completedEntry);
+             }
 
-            // Send toolCallCompleted to webview
-            this._view?.webview.postMessage({
-                type: 'toolCallCompleted',
-                entry: completedEntry
-            } as ToWebviewMessage);
+             this._view?.webview.postMessage({
+                 type: 'toolCallCompleted',
+                 entry: completedEntry
+             } as ToWebviewMessage);
 
-            this._updateCurrentSessionUI();
-            this._saveQueueToDisk();
-            this._updateQueueUI();
+             this._updateCurrentSessionUI();
+             this._saveQueueToDisk();
+             this._updateQueueUI();
 
-            resolve({ value: queuedPrompt.prompt, queue: true, attachments: queuedPrompt.attachments || [] });
-            this._pendingRequests.delete(this._currentToolCallId!);
-            this._currentToolCallId = null;
+             resolve({ value: queuedPrompt.prompt, queue: true, attachments: queuedPrompt.attachments || [] });
+
+             this._incomingRequests.delete(this._currentToolCallId);
+             this._currentToolCallId = null;
+             this._updateIncomingRequestsUI();
+
+             if (this._incomingRequests.size > 0) {
+                 const nextId = this._incomingRequests.keys().next().value;
+                 if (nextId) {
+                     this._setActiveRequest(nextId);
+                 }
+             }
         } else {
             // No pending request - add to queue normally
             this._promptQueue.push(queuedPrompt);
@@ -1516,8 +1595,6 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             if (parsed.scheme !== 'context') return undefined;
 
             const type = parsed.authority as ContextReferenceType;
-            // id is likely in path, e.g. /id
-            const id = parsed.path.startsWith('/') ? parsed.path.substring(1) : parsed.path;
 
             const contextRef = await this._contextManager.getContextContent(type);
             return contextRef?.content;
@@ -1766,7 +1843,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                 </div>
                 <h1 class="welcome-title">Let's build</h1>
                 <p class="welcome-subtitle">Sync your tasks, automate your workflow</p>
-                
+
                 <div class="welcome-cards">
                     <div class="welcome-card welcome-card-vibe" id="card-vibe">
                         <div class="welcome-card-header">
@@ -1783,6 +1860,15 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                         <p class="welcome-card-desc">Batch your responses. AI consumes from queue automatically, one by one.</p>
                     </div>
                 </div>
+            </div>
+
+            <!-- Agent Requests Area -->
+            <div class="agent-requests-area hidden" id="agent-requests-area">
+                <div class="agent-requests-header">
+                    <span class="codicon codicon-bell-dot"></span>
+                    <span class="agent-requests-title">Incoming Requests</span>
+                </div>
+                <div class="agent-requests-list" id="agent-requests-list"></div>
             </div>
 
             <!-- Tool Call History Area -->
@@ -1882,7 +1968,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
      * Detects numbered lists (1. 2. 3.), lettered options (A. B. C.), and Option X: patterns.
      * Only detects choices near the LAST question mark "?" to avoid false positives from
      * earlier numbered/lettered content in the text.
-     * 
+     *
      * @param text - The question text to parse
      * @returns Array of parsed choices, empty if no choices detected
      */
@@ -2085,7 +2171,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
     /**
      * Detect if a question is an approval/confirmation type that warrants quick action buttons.
      * Uses NLP patterns to identify yes/no questions, permission requests, and confirmations.
-     * 
+     *
      * @param text - The question text to analyze
      * @returns true if the question is an approval-type question
      */
