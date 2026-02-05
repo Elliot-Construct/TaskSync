@@ -60,6 +60,7 @@ export interface IncomingRequest {
     projectName?: string;
     timestamp: number;
     resolve: (result: UserResponseResult) => void;
+    reject: (error: Error) => void;
 }
 
 // Parsed choice from question
@@ -403,29 +404,14 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
         this._currentSessionCallsMap.clear();
 
         // Clear pending requests (reject any waiting promises)
-        for (const request of this._pendingRequests.values()) {
-            const maybeReject = (request as any)?.reject;
-            if (typeof maybeReject === 'function') {
-                try {
-                    maybeReject(new Error('Extension disposed before response was received.'));
-                } catch {
-                    // Ignore errors thrown while rejecting pending requests during dispose
-                }
+        for (const request of this._incomingRequests.values()) {
+            try {
+                request.reject(new Error('Extension disposed before response was received.'));
+            } catch {
+                // Ignore errors thrown while rejecting pending requests during dispose
             }
         }
         this._pendingRequests.clear();
-
-        // Clear incoming requests (reject any waiting promises)
-        for (const request of this._incomingRequests.values()) {
-            const maybeReject = (request as any)?.reject;
-            if (typeof maybeReject === 'function') {
-                try {
-                    maybeReject(new Error('Extension disposed before response was received.'));
-                } catch {
-                    // Ignore errors thrown while rejecting incoming requests during dispose
-                }
-            }
-        }
         this._incomingRequests.clear();
 
         // Clean up temp images from current session before clearing
@@ -544,7 +530,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
 
         this._view.show(true);
 
-        return new Promise<UserResponseResult>((resolve) => {
+        return new Promise<UserResponseResult>((resolve, reject) => {
             // Use provided project name, or fallback to workspace name if available
             const effectiveProjectName = projectName || vscode.workspace.name;
 
@@ -554,7 +540,8 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                 agentName,
                 projectName: effectiveProjectName,
                 timestamp: Date.now(),
-                resolve
+                resolve,
+                reject
             };
             this._incomingRequests.set(toolCallId, request);
             this._updateIncomingRequestsUI();
