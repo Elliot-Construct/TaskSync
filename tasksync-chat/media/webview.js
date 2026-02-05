@@ -962,7 +962,7 @@
         if (!toolHistoryArea) return;
 
         // Filter by active agent if selected
-        let filteredCalls;
+        let filteredCalls = currentSessionCalls;
         if (activeAgent) {
             filteredCalls = currentSessionCalls.filter(c => (c.agentName || 'Unknown Agent') === activeAgent);
         } else {
@@ -1433,6 +1433,7 @@
     }
 
     function getAgentsList() {
+        const agents = new Set();
         const agentMap = new Map();
 
         // Add agents from incoming requests
