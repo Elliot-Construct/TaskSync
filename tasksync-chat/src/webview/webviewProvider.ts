@@ -121,7 +121,8 @@ type FromWebviewMessage =
     | { type: 'updateHumanDelayMax'; value: number }
     | { type: 'updateSendWithCtrlEnterSetting'; enabled: boolean }
     | { type: 'searchContext'; query: string }
-    | { type: 'selectContextReference'; contextType: string; options?: Record<string, unknown> };
+    | { type: 'selectContextReference'; contextType: string; options?: Record<string, unknown> }
+    | { type: 'copyToClipboard'; text: string };
 
 
 export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
@@ -1248,6 +1249,9 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             case 'selectContextReference':
                 this._handleSelectContextReference(message.contextType, message.options);
                 break;
+            case 'copyToClipboard':
+                void this._handleCopyToClipboard(message.text);
+                break;
         }
     }
 
@@ -2196,6 +2200,22 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
         } catch (error) {
             console.error('[TaskSync] Failed to open external link:', error);
             vscode.window.showWarningMessage('Unable to open external link');
+        }
+    }
+
+    /**
+     * Copy plain text to the system clipboard via extension host API.
+     */
+    private async _handleCopyToClipboard(text: string): Promise<void> {
+        if (typeof text !== 'string' || text.length === 0) {
+            return;
+        }
+
+        try {
+            await vscode.env.clipboard.writeText(text);
+        } catch (error) {
+            console.error('[TaskSync] Failed to copy text to clipboard:', error);
+            vscode.window.showWarningMessage('Unable to copy content to clipboard');
         }
     }
 

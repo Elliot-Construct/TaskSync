@@ -16,6 +16,8 @@
     let selectedCard = 'queue';
     let currentSessionCalls = []; // Current session tool calls (shown in chat)
     let persistedHistory = []; // Past sessions history (shown in modal)
+    let lastContextMenuTarget = null; // Tracks where right-click was triggered for copy fallback behavior
+    let lastContextMenuTimestamp = 0; // Ensures stale right-click targets are not reused for copy
     let pendingToolCall = null;
     let isProcessingResponse = false; // True when AI is processing user's response
     let isApprovalQuestion = false; // True when current pending question is an approval-type question
@@ -38,6 +40,7 @@
     let humanLikeDelayEnabled = true;
     let humanLikeDelayMin = 2;  // minimum seconds
     let humanLikeDelayMax = 6;  // maximum seconds
+    var CONTEXT_MENU_COPY_MAX_AGE_MS = 30000;
 
     // Tracks local edits to prevent stale settings overwriting user input mid-typing.
     let autopilotTextEditVersion = 0;
@@ -580,6 +583,11 @@
             if (autocompleteVisible && !e.target.closest('.autocomplete-dropdown') && !e.target.closest('#chat-input')) hideAutocomplete();
             if (slashDropdownVisible && !e.target.closest('.slash-dropdown') && !e.target.closest('#chat-input')) hideSlashDropdown();
         });
+
+        // Remember right-click target so context-menu Copy can resolve the exact clicked message.
+        document.addEventListener('contextmenu', handleContextMenu);
+        // Intercept Copy when nothing is selected and copy clicked message text as-is.
+        document.addEventListener('copy', handleCopy);
 
         if (queueHeader) queueHeader.addEventListener('click', handleQueueHeaderClick);
         if (historyModalClose) historyModalClose.addEventListener('click', closeHistoryModal);
@@ -2852,6 +2860,165 @@
                 return;
             }
         }
+    }
+
+    /**
+     * Capture latest right-click position for context-menu copy resolution.
+     */
+    function handleContextMenu(event) {
+        if (!event || !event.target || !event.target.closest) {
+            lastContextMenuTarget = null;
+            lastContextMenuTimestamp = 0;
+            return;
+        }
+
+        lastContextMenuTarget = event.target;
+        lastContextMenuTimestamp = Date.now();
+    }
+
+    /**
+     * Override Copy when nothing is selected and context-menu target points to a message.
+     */
+    function handleCopy(event) {
+        var selection = window.getSelection ? window.getSelection() : null;
+        if (selection && selection.toString().length > 0) {
+            return;
+        }
+
+        if (!lastContextMenuTarget || (Date.now() - lastContextMenuTimestamp) > CONTEXT_MENU_COPY_MAX_AGE_MS) {
+            return;
+        }
+
+        var copyText = resolveCopyTextFromTarget(lastContextMenuTarget);
+        if (!copyText) {
+            return;
+        }
+
+        if (event) {
+            event.preventDefault();
+        }
+
+        if (event && event.clipboardData) {
+            try {
+                event.clipboardData.setData('text/plain', copyText);
+                lastContextMenuTarget = null;
+                lastContextMenuTimestamp = 0;
+                return;
+            } catch (error) {
+                // Fall through to extension host clipboard API fallback.
+            }
+        }
+
+        vscode.postMessage({ type: 'copyToClipboard', text: copyText });
+        lastContextMenuTarget = null;
+        lastContextMenuTimestamp = 0;
+    }
+
+    /**
+     * Resolve copy payload from the exact message area that was right-clicked.
+     */
+    function resolveCopyTextFromTarget(target) {
+        if (!target || !target.closest) {
+            return '';
+        }
+
+        var pendingQuestion = target.closest('.pending-ai-question');
+        if (pendingQuestion) {
+            if (pendingToolCall && typeof pendingToolCall.prompt === 'string') {
+                return pendingToolCall.prompt;
+            }
+            return (pendingQuestion.textContent || '').trim();
+        }
+
+        var toolCallEntry = resolveToolCallEntryFromTarget(target);
+        if (!toolCallEntry) {
+            return '';
+        }
+
+        if (target.closest('.tool-call-ai-response')) {
+            return typeof toolCallEntry.prompt === 'string' ? toolCallEntry.prompt : '';
+        }
+
+        if (target.closest('.tool-call-user-response')) {
+            return typeof toolCallEntry.response === 'string' ? toolCallEntry.response : '';
+        }
+
+        if (target.closest('.chips-container')) {
+            return formatAttachmentsForCopy(toolCallEntry.attachments);
+        }
+
+        return formatToolCallEntryForCopy(toolCallEntry);
+    }
+
+    /**
+     * Resolve a tool call entry by traversing from a DOM target to its card id.
+     */
+    function resolveToolCallEntryFromTarget(target) {
+        var card = target.closest('.tool-call-card');
+        if (!card) {
+            return null;
+        }
+
+        return resolveToolCallEntryFromCardId(card.getAttribute('data-id'));
+    }
+
+    /**
+     * Find a tool call entry in current session first, then persisted history.
+     */
+    function resolveToolCallEntryFromCardId(cardId) {
+        if (!cardId) {
+            return null;
+        }
+
+        var currentEntry = currentSessionCalls.find(function (tc) { return tc.id === cardId; });
+        if (currentEntry) {
+            return currentEntry;
+        }
+
+        var persistedEntry = persistedHistory.find(function (tc) { return tc.id === cardId; });
+        return persistedEntry || null;
+    }
+
+    /**
+     * Compose full card copy output when right-click happened outside a specific message block.
+     */
+    function formatToolCallEntryForCopy(entry) {
+        if (!entry) {
+            return '';
+        }
+
+        var parts = [];
+        if (typeof entry.prompt === 'string' && entry.prompt.length > 0) {
+            parts.push(entry.prompt);
+        }
+        if (typeof entry.response === 'string' && entry.response.length > 0) {
+            parts.push(entry.response);
+        }
+
+        var attachmentsText = formatAttachmentsForCopy(entry.attachments);
+        if (attachmentsText) {
+            parts.push(attachmentsText);
+        }
+
+        return parts.join('\n\n');
+    }
+
+    /**
+     * Convert attachment list to plain text while preserving stored attachment names.
+     */
+    function formatAttachmentsForCopy(attachments) {
+        if (!attachments || attachments.length === 0) {
+            return '';
+        }
+
+        return attachments.map(function (att) {
+            if (att && typeof att.name === 'string' && att.name.length > 0) {
+                return att.name;
+            }
+            return att && typeof att.uri === 'string' ? att.uri : '';
+        }).filter(function (value) {
+            return value.length > 0;
+        }).join('\n');
     }
 
     function processImageFile(file) {
