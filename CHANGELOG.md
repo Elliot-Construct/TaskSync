@@ -2,9 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## TaskSync v2.0.24 (02-25-26)
+- feat: add cycling autopilot prompts array with drag-to-reorder
+- Multiple prompts cycle in order (1→2→3→1...) with each `ask_user` call
+- Add, edit, delete, and drag-to-reorder prompts in Settings modal
+- Backward compatible: existing `autopilotText` setting migrates automatically
+- Index resets on new session; preserved when toggling autopilot or manual response
+
 ## TaskSync v2.0.23 (02-24-26)
 - feat: implement context menu copy functionality and clipboard integration
-
 
 ## TaskSync v2.0.22 (02-21-26)
 - fix: simplify extension description for clarity
