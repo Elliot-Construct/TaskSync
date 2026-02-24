@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## TaskSync v2.0.23 (02-24-26)
+- feat: implement context menu copy functionality and clipboard integration
+
+
 ## TaskSync v2.0.22 (02-21-26)
 - fix: simplify extension description for clarity
 
