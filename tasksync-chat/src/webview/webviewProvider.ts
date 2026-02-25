@@ -75,7 +75,7 @@ type ToWebviewMessage =
     | { type: 'updateAttachments'; attachments: AttachmentInfo[] }
     | { type: 'imageSaved'; attachment: AttachmentInfo }
     | { type: 'openSettingsModal' }
-    | { type: 'updateSettings'; soundEnabled: boolean; interactiveApprovalEnabled: boolean; autopilotEnabled: boolean; autopilotText: string; reusablePrompts: ReusablePrompt[]; responseTimeout: number; sessionWarningHours: number; maxConsecutiveAutoResponses: number; humanLikeDelayEnabled: boolean; humanLikeDelayMin: number; humanLikeDelayMax: number; sendWithCtrlEnter: boolean }
+    | { type: 'updateSettings'; soundEnabled: boolean; interactiveApprovalEnabled: boolean; autopilotEnabled: boolean; autopilotText: string; autopilotPrompts: string[]; reusablePrompts: ReusablePrompt[]; responseTimeout: number; sessionWarningHours: number; maxConsecutiveAutoResponses: number; humanLikeDelayEnabled: boolean; humanLikeDelayMin: number; humanLikeDelayMax: number; sendWithCtrlEnter: boolean }
     | { type: 'slashCommandResults'; prompts: ReusablePrompt[] }
     | { type: 'playNotificationSound' }
     | { type: 'contextSearchResults'; suggestions: Array<{ type: string; label: string; description: string; detail: string }> }
@@ -107,6 +107,10 @@ type FromWebviewMessage =
     | { type: 'updateInteractiveApprovalSetting'; enabled: boolean }
     | { type: 'updateAutopilotSetting'; enabled: boolean }
     | { type: 'updateAutopilotText'; text: string }
+    | { type: 'addAutopilotPrompt'; prompt: string }
+    | { type: 'editAutopilotPrompt'; index: number; prompt: string }
+    | { type: 'removeAutopilotPrompt'; index: number }
+    | { type: 'reorderAutopilotPrompts'; fromIndex: number; toIndex: number }
     | { type: 'addReusablePrompt'; name: string; prompt: string }
     | { type: 'editReusablePrompt'; id: string; name: string; prompt: string }
     | { type: 'removeReusablePrompt'; id: string }
@@ -190,8 +194,14 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
     // Autopilot enabled (loaded from VS Code settings)
     private _autopilotEnabled: boolean = false;
 
-    // Autopilot text (loaded from VS Code settings)
+    // Autopilot text (legacy, kept for backward compatibility)
     private _autopilotText: string = '';
+
+    // Autopilot prompts array (cycles through in order)
+    private _autopilotPrompts: string[] = [];
+
+    // Current index in autopilot prompts cycle (resets on new session)
+    private _autopilotIndex: number = 0;
 
     // Human-like delay settings: adds random jitter before auto-responses.
     // Simulates natural human reading/typing time for a more realistic workflow.
@@ -260,6 +270,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                     e.affectsConfiguration('tasksync.interactiveApproval') ||
                     e.affectsConfiguration('tasksync.autopilot') ||
                     e.affectsConfiguration('tasksync.autopilotText') ||
+                    e.affectsConfiguration('tasksync.autopilotPrompts') ||
                     e.affectsConfiguration('tasksync.autoAnswer') ||
                     e.affectsConfiguration('tasksync.autoAnswerText') ||
                     e.affectsConfiguration('tasksync.reusablePrompts') ||
@@ -342,6 +353,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             this._currentToolCallId = null;
         }
         this._consecutiveAutoResponses = 0;
+        this._autopilotIndex = 0; // Reset autopilot prompts cycle
 
         // Save current completed entries to persisted history
         this.saveCurrentSessionToHistory();
@@ -624,6 +636,19 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             this._autopilotText = this._normalizeAutopilotText(configuredAutopilotText, config);
         }
 
+        // Load autopilot prompts array (with fallback to autopilotText for migration)
+        const savedAutopilotPrompts = config.get<string[]>('autopilotPrompts', []);
+        if (savedAutopilotPrompts.length > 0) {
+            // Use the configured prompts array, filtering out empty strings
+            this._autopilotPrompts = savedAutopilotPrompts.filter(p => p.trim().length > 0);
+        } else if (this._autopilotText && this._autopilotText !== defaultAutopilotText) {
+            // Migration: use existing autopilotText as the single prompt
+            this._autopilotPrompts = [this._autopilotText];
+        } else {
+            // Default: empty array (will fall back to default text in cycling logic)
+            this._autopilotPrompts = [];
+        }
+
         // Load reusable prompts from settings
         const savedPrompts = config.get<Array<{ name: string; prompt: string }>>('reusablePrompts', []);
         this._reusablePrompts = savedPrompts.map((p, index) => ({
@@ -678,6 +703,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             interactiveApprovalEnabled: this._interactiveApprovalEnabled,
             autopilotEnabled: this._autopilotEnabled,
             autopilotText: this._autopilotText,
+            autopilotPrompts: this._autopilotPrompts,
             reusablePrompts: this._reusablePrompts,
             responseTimeout: responseTimeout,
             sessionWarningHours: this._sessionWarningHours,
@@ -870,7 +896,14 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                 if (!this._autopilotEnabled || this._currentToolCallId !== toolCallId) {
                     // State changed during delay — fall through to normal pending request flow
                 } else {
-                    const effectiveText = this._normalizeAutopilotText(this._autopilotText);
+                    // Get the next prompt from the cycling array (or fallback to default)
+                    let effectiveText: string;
+                    if (this._autopilotPrompts.length > 0) {
+                        effectiveText = this._autopilotPrompts[this._autopilotIndex];
+                        this._autopilotIndex = (this._autopilotIndex + 1) % this._autopilotPrompts.length;
+                    } else {
+                        effectiveText = this._normalizeAutopilotText(this._autopilotText);
+                    }
                     vscode.window.showInformationMessage(`TaskSync: Autopilot auto-responded. (${this._consecutiveAutoResponses}/${maxConsecutive})`);
 
                     const entry: ToolCallEntry = {
@@ -1203,6 +1236,18 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                 break;
             case 'updateAutopilotText':
                 this._handleUpdateAutopilotText(message.text);
+                break;
+            case 'addAutopilotPrompt':
+                this._handleAddAutopilotPrompt(message.prompt);
+                break;
+            case 'editAutopilotPrompt':
+                this._handleEditAutopilotPrompt(message.index, message.prompt);
+                break;
+            case 'removeAutopilotPrompt':
+                this._handleRemoveAutopilotPrompt(message.index);
+                break;
+            case 'reorderAutopilotPrompts':
+                this._handleReorderAutopilotPrompts(message.fromIndex, message.toIndex);
                 break;
             case 'addReusablePrompt':
                 this._handleAddReusablePrompt(message.name, message.prompt);
@@ -1974,6 +2019,92 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             const normalizedText = this._normalizeAutopilotText(text, config);
             this._autopilotText = normalizedText;
             await config.update('autopilotText', normalizedText, vscode.ConfigurationTarget.Workspace);
+        } finally {
+            this._isUpdatingConfig = false;
+        }
+    }
+
+    /**
+     * Handle adding a new autopilot prompt to the cycling array
+     */
+    private async _handleAddAutopilotPrompt(prompt: string): Promise<void> {
+        const trimmedPrompt = prompt.trim();
+        if (!trimmedPrompt) return;
+
+        this._autopilotPrompts.push(trimmedPrompt);
+        await this._saveAutopilotPrompts();
+        this._updateSettingsUI();
+    }
+
+    /**
+     * Handle editing an autopilot prompt at a specific index
+     */
+    private async _handleEditAutopilotPrompt(index: number, prompt: string): Promise<void> {
+        const trimmedPrompt = prompt.trim();
+        if (!trimmedPrompt || index < 0 || index >= this._autopilotPrompts.length) return;
+
+        this._autopilotPrompts[index] = trimmedPrompt;
+        await this._saveAutopilotPrompts();
+        this._updateSettingsUI();
+    }
+
+    /**
+     * Handle removing an autopilot prompt at a specific index
+     */
+    private async _handleRemoveAutopilotPrompt(index: number): Promise<void> {
+        if (index < 0 || index >= this._autopilotPrompts.length) return;
+
+        this._autopilotPrompts.splice(index, 1);
+
+        // Adjust index to track the same prompt after deletion
+        if (this._autopilotIndex > index) {
+            this._autopilotIndex--;
+        } else if (this._autopilotIndex >= this._autopilotPrompts.length) {
+            this._autopilotIndex = 0;
+        }
+
+        await this._saveAutopilotPrompts();
+        this._updateSettingsUI();
+    }
+
+    /**
+     * Handle reordering autopilot prompts (drag and drop)
+     */
+    private async _handleReorderAutopilotPrompts(fromIndex: number, toIndex: number): Promise<void> {
+        if (fromIndex < 0 || fromIndex >= this._autopilotPrompts.length ||
+            toIndex < 0 || toIndex >= this._autopilotPrompts.length ||
+            fromIndex === toIndex) {
+            return;
+        }
+
+        // Adjust autopilot index to track the same prompt after reorder
+        if (this._autopilotIndex === fromIndex) {
+            // The prompt we're currently on moved
+            this._autopilotIndex = toIndex;
+        } else if (fromIndex < this._autopilotIndex && toIndex >= this._autopilotIndex) {
+            // A prompt before our position moved after it
+            this._autopilotIndex--;
+        } else if (fromIndex > this._autopilotIndex && toIndex <= this._autopilotIndex) {
+            // A prompt after our position moved before it
+            this._autopilotIndex++;
+        }
+
+        // Remove from old position and insert at new position
+        const [removed] = this._autopilotPrompts.splice(fromIndex, 1);
+        this._autopilotPrompts.splice(toIndex, 0, removed);
+
+        await this._saveAutopilotPrompts();
+        this._updateSettingsUI();
+    }
+
+    /**
+     * Save autopilot prompts to VS Code configuration
+     */
+    private async _saveAutopilotPrompts(): Promise<void> {
+        this._isUpdatingConfig = true;
+        try {
+            const config = vscode.workspace.getConfiguration('tasksync');
+            await config.update('autopilotPrompts', this._autopilotPrompts, vscode.ConfigurationTarget.Global);
         } finally {
             this._isUpdatingConfig = false;
         }

@@ -17,11 +17,11 @@ Direct interaction with AI agents - respond to each request as it comes in with 
 
 ### Autopilot
 Let AI agents work autonomously by automatically responding to `ask_user` prompts. When enabled:
-- Agents receive a configurable auto-response instead of waiting for your input
+- Add multiple prompts that cycle in order (1→2→3→1...) with each `ask_user` call
+- Drag to reorder, edit, or delete individual prompts in the Settings modal
 - Toggle on/off from the Autopilot switch below the send button, or in Settings
-- Customize the Autopilot response text in Settings to control agent behavior
 - **Queue priority**: queued prompts are ALWAYS sent first — Autopilot only triggers when the queue is empty
-- Perfect for hands-free operation on well-defined tasks
+- Perfect for varying instructions mid-session or hands-free operation on well-defined tasks
 
 ### Response Timeout (Auto-respond when idle)
 Prevent tool calls from waiting indefinitely when you're away:
@@ -101,10 +101,11 @@ Paste or drag-and-drop images directly into the chat input. Images are automatic
 
 ### Autopilot Mode
 1. Enable **Autopilot** from the toggle below the send button, or in Settings
-2. When an AI agent calls `ask_user`, TaskSync automatically responds with your configured Autopilot text
-3. Customize the response text in Settings (gear icon) → Autopilot
-4. **Queue priority**: queued prompts are always sent first — Autopilot only triggers when the queue is empty
-5. Toggle off anytime to return to manual interaction
+2. When an AI agent calls `ask_user`, TaskSync automatically responds with the next prompt in your cycling list
+3. Add multiple prompts in Settings (gear icon) → Autopilot Prompts — they cycle 1→2→3→1...
+4. Drag to reorder, click to edit, or delete individual prompts
+5. **Queue priority**: queued prompts are always sent first — Autopilot only triggers when the queue is empty
+6. Toggle off anytime to return to manual interaction
 
 ### File References
 1. Type `#` in the input field
