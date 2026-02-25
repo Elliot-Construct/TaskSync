@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## TaskSync v2.0.25 (02-25-26)
+- feat: add cycling autopilot prompts array with drag-to-reorder
+
+
 ## TaskSync v2.0.24 (02-25-26)
 - feat: add cycling autopilot prompts array with drag-to-reorder
 - Multiple prompts cycle in order (1→2→3→1...) with each `ask_user` call
